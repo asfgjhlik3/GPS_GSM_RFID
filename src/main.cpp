@@ -5,8 +5,14 @@
 #define LILYGO_T_A7670
 #define TINY_GSM_RX_BUFFER 1024
 #include "utilities.h"
+#include <iostream>
+#include "stops.h"
+#include "fare.h"
 #include <TinyGsmClient.h>
 #include <TinyGPS++.h>
+#include <ArduinoHttpClient.h>  // For HTTP requests
+#include <WiFi.h>
+#include <esp_now.h>
 
 #define RST_PIN 4
 #define SS_PIN 5
@@ -26,6 +32,16 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 
+TinyGsmClient client(modem);
+HttpClient http(client, server, port);
+
+typedef struct struct_message {
+  char uid[20];
+} struct_message;
+
+uint8_t driverMAC[] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};  // Replace with your Driver ESP32 MAC address
+
+
 struct Passenger {
   String uid;
   String tapInStop;
@@ -36,11 +52,8 @@ struct Passenger {
 Passenger onboardPassengers[MAX_PASSENGERS];
 int passengerCount = 0;
 
-// Fare
-const int FARE = 15;
-
-// Dummy recipient number
-String phoneNumber = "+639518840538";
+const char server[] = "192.168.1.100";  // Replace with your local server IP
+const int port = 80;
 
 int readBalance() { return 100; }
 bool writeBalance(int newBalance) { return true; }
@@ -52,14 +65,38 @@ int findPassengerIndex(String uid) {
   return -1;
 }
 
-void sendSMS(String message) {
-  Serial.println("📤 Sending SMS...");
-  if (modem.sendSMS(phoneNumber, message)) {
+void sendSMS(const String& uid, const String& message) {
+  String phoneNumber = getPhoneNumberByUID(uid);
+  if (phoneNumber == "") {
+    Serial.println("❌ No phone number found for UID: " + uid);
+    return;
+  }
+
+  Serial.println("📤 Sending SMS to " + phoneNumber);
+  if (modem.sendSMS(phoneNumber.c_str(), message)) {
     Serial.println("✅ SMS sent!");
   } else {
     Serial.println("❌ SMS failed.");
   }
 }
+
+
+String getPhoneNumberByUID(const String& uid) {
+  String path = "/get-phone?uid=" + uid;
+  http.get(path);
+
+  int statusCode = http.responseStatusCode();
+  String response = http.responseBody();
+
+  if (statusCode == 200) {
+    response.trim();
+    return response;  // Assuming the response is just the phone number
+  } else {
+    Serial.println("❌ Failed to retrieve phone number. Status: " + String(statusCode));
+    return "";
+  }
+}
+
 
 String getLocationString() {
   float lat = 0, lon = 0, speed = 0, alt = 0, acc = 0;
@@ -136,11 +173,39 @@ void setup() {
   } else {
     Serial.println("❌ Failed to set SMS text mode");
   }
-  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);  // Required for ESP-NOW
+WiFi.disconnect();
+
+if (esp_now_init() != ESP_OK) {
+  Serial.println("❌ Error initializing ESP-NOW");
+  return;
+}
+
+esp_now_peer_info_t peerInfo = {};
+memcpy(peerInfo.peer_addr, driverMAC, 6);
+peerInfo.channel = 0;  
+peerInfo.encrypt = false;
+
+if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+  Serial.println("❌ Failed to add ESP-NOW peer");
+}
+
+  
   SPI.begin(18, 19, 23, 5);  // SCK, MISO, MOSI, SS (last one is optional)
   rfid.PCD_Init();
   Wire.begin();
   Serial.println("🚍 RFID Fare System Ready");
+}
+extern float fareMatrix[21][21];  // Your fare matrix, assuming it's 21x21
+extern String busStops[21];  
+
+int findStopIndex(String stopName) {
+  for (int i = 0; i < 21; i++) {  // Assuming 21 bus stops
+    if (busStops[i] == stopName) {
+      return i;  // Return the index if the stop name matches
+    }
+  }
+  return -1;  // Return -1 if the stop name was not found
 }
 
 void loop() {
@@ -158,36 +223,78 @@ void loop() {
 
     if (index == -1) {
       if (passengerCount < MAX_PASSENGERS) {
-        onboardPassengers[passengerCount++] = { uid, "N/A", millis() };
+        float lat, lon, speed, alt, acc;
+        uint8_t fixMode;
+        int vsat, usat, yr, mon, day, hr, min, sec;
+    
+        String tapInStop = "N/A";
+        if (modem.getGPS(&fixMode, &lat, &lon, &speed, &alt, &vsat, &usat, &acc, &yr, &mon, &day, &hr, &min, &sec)) {
+          tapInStop = getNearestStopFromGPS(lat, lon);
+        }
+    
+        onboardPassengers[passengerCount++] = { uid, tapInStop, millis() };
         Serial.println("✅ Tap-In recorded");
+        // Send UID via ESP-NOW
+struct_message message;
+uid.toCharArray(message.uid, sizeof(message.uid));
+esp_err_t result = esp_now_send(driverMAC, (uint8_t *) &message, sizeof(message));
+
+if (result == ESP_OK) {
+  Serial.println("📤 UID sent via ESP-NOW: " + uid);
+} else {
+  Serial.println("❌ Failed to send UID via ESP-NOW");
+}
+
+        
         Serial.print("🆔 UID: "); Serial.println(uid);
       } else {
         Serial.println("❌ Max passengers reached");
       }
-
+    
       rfid.PICC_HaltA();
       return;
-    }
+    }    
 
     int balance = readBalance();
 
-    if (balance >= FARE) {
-      int newBalance = balance - FARE;
+    if (balance >= getFare) {
+      // Get current GPS location
+float lat = 0, lon = 0;
+uint8_t fixMode = 0;
+int vsat = 0, usat = 0, yr = 0, mon = 0, day = 0, hr = 0, min = 0, sec = 0;
+float speed, alt, acc;
+
+if (modem.getGPS(&fixMode, &lat, &lon, &speed, &alt, &vsat, &usat, &acc, &yr, &mon, &day, &hr, &min, &sec)) {
+    String tapOutStop = getNearestStopFromGPS(lat, lon);
+    String tapInStop = onboardPassengers[index].tapInStop;
+
+    int tapInIndex = findStopIndex(tapInStop);
+        int tapOutIndex = findStopIndex(tapOutStop);
+
+        // Calculate the fare using the fare matrix
+        if (tapInIndex >= 0 && tapOutIndex >= 0) {
+          float fare = getFare(tapInIndex, tapOutIndex, false);  // Assuming false for non-reverse direction
+          if (fare < 0) {
+            Serial.println("❌ Unable to calculate fare.");
+            return;
+          }
+
+    int newBalance = balance - (int)fare;
       if (writeBalance(newBalance)) {
         unsigned long travelTime = (millis() - onboardPassengers[index].tapInTime) / 1000;
         Serial.println("✅ Tap-Out Success");
-        Serial.print("💸 ₱"); Serial.print(FARE);
+        Serial.print("💸 ₱"); Serial.print(fare);
         Serial.print(" deducted | Remaining: ₱"); Serial.println(newBalance);
         Serial.print("🕒 Duration: "); Serial.print(travelTime); Serial.println("s");
 
         String gpsData = getLocationString();
 
-String smsMsg = "🚌 e-Ticket\nFare: ₱" + String(FARE) + 
+String smsMsg = "🚌 e-Ticket\nFare: ₱" + String(fare) + 
                 "\nCard: " + uid + 
                 "\nBalance: ₱" + newBalance + 
                 "\n" + gpsData;
 
-        sendSMS(smsMsg);
+                sendSMS(uid, smsMsg);
 
         // Remove passenger from list
         for (int i = index; i < passengerCount - 1; i++) {
@@ -196,6 +303,9 @@ String smsMsg = "🚌 e-Ticket\nFare: ₱" + String(FARE) +
         passengerCount--;
       }
     } else {
+      Serial.println("❌ Invalid bus stop indices.");
+    }
+  }else {
       Serial.println("❌ Not enough balance.");
     }
 
