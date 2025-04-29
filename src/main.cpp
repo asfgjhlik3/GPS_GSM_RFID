@@ -8,6 +8,7 @@
 #include <iostream>
 #include "stops.h"
 #include "fare.h"
+#include "feedback.h"
 #include <TinyGsmClient.h>
 #include <TinyGPS++.h>
 #include <ArduinoHttpClient.h>  // For HTTP requests
@@ -39,7 +40,7 @@ typedef struct struct_message {
   char uid[20];
 } struct_message;
 
-uint8_t driverMAC[] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};  // Replace with your Driver ESP32 MAC address
+uint8_t driverMAC[] = {0xA8, 0x42, 0xE3, 0xC8, 0x36, 0x88};  // Replace with your Driver ESP32 MAC address
 
 
 struct Passenger {
@@ -190,7 +191,7 @@ if (esp_now_add_peer(&peerInfo) != ESP_OK) {
   Serial.println("❌ Failed to add ESP-NOW peer");
 }
 
-  
+setupFeedback();
   SPI.begin(18, 19, 23, 5);  // SCK, MISO, MOSI, SS (last one is optional)
   rfid.PCD_Init();
   Wire.begin();
@@ -210,7 +211,7 @@ int findStopIndex(String stopName) {
 
 void loop() {
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    // Convert UID to string
+    clearStandbyMode();
     String uid = "";
     for (byte i = 0; i < rfid.uid.size; i++) {
       uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
@@ -218,7 +219,7 @@ void loop() {
     }
     uid.toUpperCase();
     Serial.println("✅ UID: " + uid);
-
+    showSuccessFeedback();
     int index = findPassengerIndex(uid);
 
     if (index == -1) {
@@ -249,11 +250,12 @@ if (result == ESP_OK) {
         Serial.print("🆔 UID: "); Serial.println(uid);
       } else {
         Serial.println("❌ Max passengers reached");
+      showFailFeedback(); // Green LED + short beep
       }
-    
       rfid.PICC_HaltA();
       return;
     }    
+    
 
     int balance = readBalance();
 
